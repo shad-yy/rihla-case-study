@@ -4,9 +4,9 @@ Rihla is software for small freight carriers that move diaspora baggage between 
 
 The source is private. This page is about the hard problems in it, most of which any team building offline-first or multi-tenant software meets sooner or later, and how each one was solved and then pinned down so it can't come back.
 
-**Stack:** React 19, TypeScript (strict), Vite, pnpm workspaces and Turborepo, Dexie (IndexedDB) for the offline copy and outbox, Workbox service worker, Supabase (Postgres, row-level security, auth) in the EU, Zod, i18next with ICU, Vitest, Playwright, StrykerJS, dependency-cruiser, ESLint, lefthook.
+**Stack:** React 19, TypeScript (strict), Vite, pnpm workspaces and Turborepo, Dexie (IndexedDB) for the offline copy and outbox, Workbox service worker, Supabase (Postgres, row-level security, auth) in the EU, Zod, i18next with ICU, Vitest, Playwright, StrykerJS, dependency-cruiser, ESLint, lefthook, GitHub Actions.
 
-**Measured on 16 Nov 2026:** 1,591 unit tests in 93 files across 7 packages, all passing. 21 tables, 52 row-level security policies in 15 migrations. 229 recorded design decisions and 128 logged defects, each with a root-cause class.
+**Measured 17–19 Nov 2026:** 1,591 unit tests in 93 files across 7 packages, all passing (17 Nov). 21 tables and 68 row-level security policies, counted by replaying the 15 migrations (some create policies in loops). 130 logged defects, each with a root-cause class (19 Nov). CI green on every job since 18 Nov.
 
 ---
 
@@ -57,7 +57,7 @@ Writing locally first was the easy part. The real failure was opening: a driver 
 
 ## Hard problem 5: Tests that pass but wouldn't notice a bug
 
-Coverage says a line ran. It doesn't say a test would notice if that line were wrong. The business-rules layer, where a wrong answer costs a carrier money, is mutation-tested with StrykerJS: it changes the code on purpose (`>` to `>=`, `+` to `-`, a condition to `true`) and checks that some test fails each time. **Run on 16 Nov 2026: 98.58%, 1,734 of 1,759 mutants killed**, and the run fails below 97%. The project's own records show the score rising from 83.99% to 97.07% in one pass of killing survivors worst-first, which added 124 tests. A finding from that pass: under Vitest 4, Stryker's per-test coverage analysis over-reported survivors. Of 43 mutants reported alive, 32 were already killed.
+Coverage says a line ran. It doesn't say a test would notice if that line were wrong. The business-rules layer, where a wrong answer costs a carrier money, is mutation-tested with StrykerJS: it changes the code on purpose (`>` to `>=`, `+` to `-`, a condition to `true`) and checks that some test fails each time. **CI run of 13 Nov 2026: 98.58%, 1,734 of 1,759 mutants killed** (the 17 Nov nightly gave the same), and the run fails below 97%. The project's own records show the score rising from 83.99% to 97.07% in one pass of killing survivors worst-first, which added 124 tests. A finding from that pass: under Vitest 4, Stryker's per-test coverage analysis over-reported survivors. Of 43 mutants reported alive, 32 were already killed.
 
 A runnable piece of these rules is public: [tariff-dead-zone](https://github.com/shad-yy/tariff-dead-zone), mutation-tested in public CI.
 
@@ -72,14 +72,46 @@ A runnable piece of these rules is public: [tariff-dead-zone](https://github.com
 
 The constraints were EU data residency (identity documents of French residents), hard tenant isolation at the query layer, and "start free, then pay per unit, never a plan jump". Five options were priced from the vendors' own pages. Convex lost on EU residency, despite being the only major backend that meters overage on its free plan. Neon and Appwrite stop or freeze instead of metering. The decision: **Supabase (EU) for structured data, Cloudflare R2 for photos**, because R2 charges nothing for egress and photos are the only thing that grows. Photos are compressed on the client to WebP (1600 px, hard cap 150 KB), so the free tier lasts for years instead of months.
 
+## Hard problem 8: A permission the screen offers but the server refuses
+
+**The trap.** The app decides which buttons to show from the user's capabilities. The server decides what to accept from its row-level security policies. They're written in different places, in different languages, and nothing checks that they agree. When they don't, a user taps a button the screen offered and gets a refusal, or worse, the server accepts something no screen should allow.
+
+**The strategy.** A permission matrix: a generated test grid of every write the app can make against every capability, run on real Postgres. Each cell asserts two things at once: whether the app offers the action, and whether the server accepts it. A mismatch in either direction fails the test, and the message names the action and the capability.
+
+**What it found.** On its first run (13 Nov 2026) it found four actions the app offered and the server refused, for example a company manager who couldn't add a city. On 18 Nov, the first draft of the fix widened access too far: in SQL, `not (NULL or …)` is `NULL`, and a policy reads `NULL` as "don't refuse". Two of the matrix's checks went red before the change was committed. The fix was `coalesce(…, false)`.
+
+**What carries over:** when two layers enforce the same rule, test their agreement, not each one on its own.
+
+---
+
+## How a change reaches main
+
+```mermaid
+flowchart LR
+  A[Client test session] --> B[Issue + root cause in the defect ledger]
+  B --> C[Branch: use cases first, test watched red, fix]
+  C --> D{Commit gate}
+  D --> E{Push gate: main refused}
+  E --> F[Pull request]
+  F --> G{CI: checks, mutation, e2e on 5 devices, database on a fresh Supabase}
+  G -- all green --> H[Merge]
+  G -- any red --> C
+```
+
+- **Commit gate (local):** typecheck, unit tests, lint, the layer rule, and sweeps for repeated defect classes.
+- **Push gate (local):** a push to `main` is refused outright. The gate also runs a secret scan over the whole history, coverage floors and end-to-end tests on five device profiles.
+- **CI on the pull request:** four jobs. One of them starts a fresh Supabase stack in Docker, applies every migration from zero and runs the database tests against it. A pull request merges only when all four are green.
+- **The gates check each other too.** On 18 Nov CI failed a policy rule that had passed locally: the local build cache had replayed an old pass, because the test reads migration files outside its own package. The migrations are now part of every task's cache key.
+- **Not built yet, said plainly:** there is no production deployment. The client tests on a development machine against a test database.
+
 ---
 
 ## How the work is run
 
 - **Every fix ships with a test that was watched going red.** Break the guard, see the test fail, restore it.
-- **A defect ledger with root-cause classes.** 128 entries, each with the surface it touched and the test that pins it. The ledger names the files that have carried more than one defect, because a change there is the most likely to break something else.
+- **A defect ledger with root-cause classes.** 130 entries, each with the surface it touched and the test that pins it. The ledger names the files that have carried more than one defect, because a change there is the most likely to break something else.
 - **A nightly run that breaks every guard on purpose** in a throwaway copy, to prove each check still fails when it should.
 - **Git hooks** run typecheck, tests, lint, the layer rule and a secret scan on every commit. A secret scan is only useful if it recognises the keys you actually use: it was extended when Supabase's new key format (plain strings rather than JWTs) turned out to be invisible to it, and it now scans the whole git history.
-- **229 decisions recorded** with their reasons, plus the options that were rejected, so nothing gets re-proposed by accident.
+- **Every decision is recorded** with its reasons, plus the options that were rejected, so nothing gets re-proposed by accident.
 
 *I set the architecture, write the specifications, review and test every change, and decide what ships. AI coding agents are the tools I direct for implementation.*
